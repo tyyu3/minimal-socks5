@@ -14,7 +14,6 @@ add_library(asio-utils
 
 target_link_libraries(asio-utils PUBLIC
     ce::utils
-    Boost::chrono
     Boost::context
     Boost::log
     Boost::thread
