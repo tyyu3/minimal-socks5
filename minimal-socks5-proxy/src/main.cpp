@@ -11,6 +11,7 @@
 #include <boost/asio/execution/execute.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/read_until.hpp>
+#include <boost/asio/read.hpp>
 #include <boost/asio/static_thread_pool.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/asio/write.hpp>
@@ -44,7 +45,11 @@ namespace ce
         class calc_session final : public socket_session<calc_session,tcp_stream>
         {
             constexpr static std::size_t number_limit_ = 1024,
-                                         bytes_per_second_limit = 1024;
+                                         bytes_per_second_limit = 1024,
+                                         max_varied_size = 256;
+            std::map<std::string, const size_t> sizes = {
+                {"client greeting", 3}
+            };
             constexpr static boost::asio::steady_timer::duration time_limit_ =
                 std::chrono::seconds(15);
         public:
@@ -60,45 +65,52 @@ namespace ce
                 // and owning as s. We need the owning capture to keep the session
                 // alive. Capturing this allows us to omit s-> before accessing
                 // any session content at the cost of one additional pointer of state.
-                spawn(this->executor(),[this,s=shared_from_this()](auto yc){
+                spawn(this->executor(),[this,s=shared_from_this()](auto yc)
+                {
+                    std::uint8_t wanted_method = 0x00;
+
                     using namespace boost::log::trivial;
-                    for(;;){
-                        stream_.expires_after(time_limit_);
-                        boost::system::error_code ec;
-                        std::size_t n = async_read_until(stream_,
-                            ba::dynamic_string_buffer{in_buf_,number_limit_},'\n',yc[ec]);
-                        if(ec){
-                            if(ec!=boost::asio::error::eof)
-                                throw boost::system::system_error{ec};
-                            BOOST_LOG_SEV(log(),info) << "Connection closed";
-                            return;
-                        }
-                        a_ = read_buffered_number(n);
-                        stream_.expires_after(time_limit_);
-                        n = async_read_until(stream_,
-                            ba::dynamic_string_buffer{in_buf_,number_limit_},'\n',yc);
-                        out_buf_ = (a_*read_buffered_number(n)).str()+'\n';
-                        stream_.expires_after(time_limit_);
-                        async_write(stream_,ba::buffer(out_buf_),yc);
+                    boost::system::error_code ec;
+                    std::uint8_t socks_ver,  // SOCKS VERSION
+                            protocols_len;  // Length of the authentication methods supported
+                    std::array<std::uint8_t, max_varied_size> protocols;  // Authentication methods supported
+
+                    // Client connects and sends a greeting...
+                    stream_.expires_after(time_limit_);
+                    ba::read(stream_, ba::buffer(&socks_ver, sizeof(socks_ver)), ba::transfer_exactly(sizeof(socks_ver)), 0);
+                    assert(socks_ver == 0x05);
+                    // ...which includes a list  of authentication methods supported.
+                    ba::read(stream_, ba::buffer(&protocols_len, sizeof(protocols_len)), ba::transfer_exactly(sizeof(protocols_len)), 0);
+                    stream_.expires_after(time_limit_);
+                    std::size_t n = ba::async_read(stream_, ba::buffer(protocols, protocols.size()), boost::asio::transfer_exactly(protocols_len), yc[ec], 0);
+                    if(ec)
+                    {
+                        if(ec!=boost::asio::error::eof)
+                            throw boost::system::system_error{ec};
+                        BOOST_LOG_SEV(log(),info) << "Connection closed";
+                        return;
                     }
-                },{},ba::bind_executor(this->cont_executor(),[](std::exception_ptr e){
-                    // We're executing on the executor that properly logs
-                    // unhandled exceptions, so just rethrow.
+                    BOOST_LOG_SEV(log(),info) << "Read: " << n;
+                    for(std::size_t i = 0; i < n; ++i)
+                    {
+                        BOOST_LOG_SEV(log(),info)<<"protocol available:"<<std::to_string(protocols[i])<<' ';
+                    }
+
+                    std::uint8_t chosen_method = wanted_method;
+                    if(std::find(protocols.begin(), protocols.end(), wanted_method) == protocols.end())
+                        chosen_method = 0xff;
+                    out_buf = {{0x05, chosen_method}};
+                    stream_.expires_after(time_limit_);
+                    ba::async_write(stream_, ba::buffer(out_buf), yc, 0);
+                },{},
+                ba::bind_executor(this->cont_executor(),[](std::exception_ptr e)
+                {
                     if(e)
                         std::rethrow_exception(e);
                 }));
             }
         private:
-            std::string in_buf_,out_buf_;
-            bigint a_;
-
-            bigint read_buffered_number(std::size_t n)
-            {
-                in_buf_[n-1] = '\0';
-                bigint x{in_buf_.data()};
-                in_buf_.erase(0,n);
-                return x;
-            }
+            std::array<std::uint8_t, max_varied_size> in_buf, out_buf;
         };
     }
 
