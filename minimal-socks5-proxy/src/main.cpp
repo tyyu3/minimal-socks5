@@ -18,6 +18,10 @@
 #include <boost/beast/core/tcp_stream.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
 
+//headers I've included in September
+#include <boost/asio/streambuf.hpp>
+#include <boost/asio.hpp>
+
 #include <exception>
 #include <memory>
 #include <stdexcept>
@@ -67,41 +71,54 @@ namespace ce
                 // any session content at the cost of one additional pointer of state.
                 spawn(this->executor(),[this,s=shared_from_this()](auto yc)
                 {
-                    std::uint8_t wanted_method = 0x00;
+                    #define NC_DBG
+                    #ifndef NC_DBG
+                        std::uint8_t wanted_version = 0x05;
+                        std::uint8_t wanted_method = 0x00;
+                        std::uint8_t failure_marker = 0xff;
+                    #endif
+                    #ifdef NC_DBG
+                        std::uint8_t wanted_version = '5';
+                        std::uint8_t wanted_method = '0';
+                        std::uint8_t failure_marker = 'F';
+                    #endif
 
                     using namespace boost::log::trivial;
                     boost::system::error_code ec;
-                    std::uint8_t socks_ver,  // SOCKS VERSION
-                            protocols_len;  // Length of the authentication methods supported
+                    // std::uint8_t socks_ver,  // SOCKS VERSION
+                    //        protocols_len;  // Length of the authentication methods supported
                     std::array<std::uint8_t, max_varied_size> protocols;  // Authentication methods supported
 
                     // Client connects and sends a greeting...
                     stream_.expires_after(time_limit_);
-                    ba::read(stream_, ba::buffer(&socks_ver, sizeof(socks_ver)), ba::transfer_exactly(sizeof(socks_ver)), 0);
-                    assert(socks_ver == 0x05);
-                    // ...which includes a list  of authentication methods supported.
-                    ba::read(stream_, ba::buffer(&protocols_len, sizeof(protocols_len)), ba::transfer_exactly(sizeof(protocols_len)), 0);
-                    stream_.expires_after(time_limit_);
-                    std::size_t n = ba::async_read(stream_, ba::buffer(protocols, protocols.size()), boost::asio::transfer_exactly(protocols_len), yc[ec], 0);
-                    if(ec)
+
+                    boost::asio::streambuf read_buffer;
+                    std::vector<std::uint8_t> read_vector;
+                    bool acceptable_response = true;
+
+                    auto bytes_transferred = boost::asio::read(stream_, read_buffer.prepare(2), ec);
+                    read_buffer.commit(bytes_transferred);
+                    // ...which includes a list of authentication methods supported.
+                    bytes_transferred = boost::asio::read(stream_, read_buffer.prepare(last_number(read_buffer)), ec);
+                    read_buffer.commit(bytes_transferred);
+                    read_vector = make_vector(read_buffer);
+                    BOOST_LOG_TRIVIAL(info) << "Read: "<< std::string(read_vector.begin(), read_vector.end()) << std::endl;
+                    if((read_vector[0] != wanted_version) || (std::find(read_vector.begin()+2, read_vector.end(), wanted_method) == read_vector.end()))
+                        acceptable_response = false;
+                    read_buffer.consume(2 + bytes_transferred); // Remove data that was read.
+
+                    // Server chooses one of the methods (or sends a failure response if none of them are acceptable).
+                    if(!acceptable_response)
                     {
-                        if(ec!=boost::asio::error::eof)
-                            throw boost::system::system_error{ec};
-                        BOOST_LOG_SEV(log(),info) << "Connection closed";
-                        return;
+                        BOOST_LOG_SEV(log(), info) << "No supported protocol or methods" << std::endl;
+                        ba::write(stream_, ba::buffer({0x05, 0xff}), ec);
+                        stream_.close();
                     }
-                    BOOST_LOG_SEV(log(),info) << "Read: " << n;
-                    for(std::size_t i = 0; i < n; ++i)
+                    else
                     {
-                        BOOST_LOG_SEV(log(),info)<<"protocol available:"<<std::to_string(protocols[i])<<' ';
+                        ba::write(stream_, ba::buffer({wanted_version, wanted_method}), ec);
                     }
 
-                    std::uint8_t chosen_method = wanted_method;
-                    if(std::find(protocols.begin(), protocols.end(), wanted_method) == protocols.end())
-                        chosen_method = 0xff;
-                    out_buf = {{0x05, chosen_method}};
-                    stream_.expires_after(time_limit_);
-                    ba::async_write(stream_, ba::buffer(out_buf), yc, 0);
                 },{},
                 ba::bind_executor(this->cont_executor(),[](std::exception_ptr e)
                 {
@@ -110,7 +127,17 @@ namespace ce
                 }));
             }
         private:
-            std::array<std::uint8_t, max_varied_size> in_buf, out_buf;
+            //  std::array<std::uint8_t, max_varied_size> in_buf, out_buf;
+            std::vector<std::uint8_t> make_vector(boost::asio::streambuf& streambuf)
+            {
+              return {boost::asio::buffers_begin(streambuf.data()),
+                      boost::asio::buffers_end(streambuf.data())};
+            }
+            std::uint8_t last_number(boost::asio::streambuf& streambuf)
+            {
+                return static_cast<std::uint8_t>(make_vector(streambuf).back() - '0'); // DEBUG_THINGY: used for symbols
+            }
+
         };
     }
 
