@@ -76,18 +76,22 @@ namespace ce
                         std::uint8_t wanted_version = 0x05;
                         std::uint8_t wanted_method = 0x00;
                         std::uint8_t failure_marker = 0xff;
+                        std::uint8_t wanted_command = 0x01;
+                        std::uint8_t wanted_reserve = 0x00;
+                        std::vector<std::uint8_t> wanted_address_type = {0x01, 0x33};
                     #endif
                     #ifdef NC_DBG
                         std::uint8_t wanted_version = '5';
                         std::uint8_t wanted_method = '0';
                         std::uint8_t failure_marker = 'F';
+                        std::uint8_t wanted_command = '1';
+                        std::uint8_t wanted_reserve = '0';
+                        std::vector<std::uint8_t> wanted_address_type = {'1', '3'};
+
                     #endif
 
                     using namespace boost::log::trivial;
                     boost::system::error_code ec;
-                    // std::uint8_t socks_ver,  // SOCKS VERSION
-                    //        protocols_len;  // Length of the authentication methods supported
-                    std::array<std::uint8_t, max_varied_size> protocols;  // Authentication methods supported
 
                     // Client connects and sends a greeting...
                     stream_.expires_after(time_limit_);
@@ -110,14 +114,59 @@ namespace ce
                     // Server chooses one of the methods (or sends a failure response if none of them are acceptable).
                     if(!acceptable_response)
                     {
-                        BOOST_LOG_SEV(log(), info) << "No supported protocol or methods" << std::endl;
-                        ba::write(stream_, ba::buffer({0x05, 0xff}), ec);
+                        BOOST_LOG_TRIVIAL(info) << "No supported protocol or methods" << std::endl;
+                        ba::write(stream_, ba::buffer({wanted_version, failure_marker}), ec);
                         stream_.close();
                     }
                     else
                     {
                         ba::write(stream_, ba::buffer({wanted_version, wanted_method}), ec);
                     }
+
+                    // Client sends a connection request similar to SOCKS4.
+                    bytes_transferred = boost::asio::read(stream_, read_buffer.prepare(4), ec);
+                    read_buffer.commit(bytes_transferred);
+                    read_vector = make_vector(read_buffer);
+                    if(read_vector[0] != wanted_version)  // TODO: & other checks here for command and reserve
+                    {
+                        BOOST_LOG_TRIVIAL(info) << "Bad response "<< std::endl;
+                        stream_.close();
+                    }
+                    if(read_vector[3] == wanted_address_type[0])  // ipv4
+                    {
+                        bytes_transferred = boost::asio::read(stream_, read_buffer.prepare(4), ec);
+                        read_buffer.commit(bytes_transferred);
+                        BOOST_LOG_TRIVIAL(info) << "IPv4" << std::endl;
+                    }
+                    if(read_vector[3] == wanted_address_type[1])  // domain
+                    {
+                        bytes_transferred = boost::asio::read(stream_, read_buffer.prepare(1), ec);
+                        read_buffer.commit(bytes_transferred);
+                        bytes_transferred = boost::asio::read(stream_, read_buffer.prepare(last_number(read_buffer)), ec);
+                        read_buffer.commit(bytes_transferred);
+                        BOOST_LOG_TRIVIAL(info) << "Domain" << std::endl;
+                    }
+                    bytes_transferred = boost::asio::read(stream_, read_buffer.prepare(2), ec);
+                    read_buffer.commit(bytes_transferred);
+                    read_vector = make_vector(read_buffer);
+                    BOOST_LOG_TRIVIAL(info) << "Read: "<< std::string(read_vector.begin(), read_vector.end()) << std::endl;
+
+                    // TODO: extract IP and port here
+
+                    // read_buffer.consume(???);
+
+                    // boost::asio::io_context m_io_context;
+                    // boost::asio::ip::tcp::socket m_stream{m_io_context};
+                    // boost::asio::connect(m_stream, boost::asio::ip::tcp::resolver{m_io_context}.resolve(ip, port));
+
+                    // Server sends a response similar to SOCKS4.
+
+                    /* spawn(this->executor(),[this,s=shared_from_this()](auto yc)
+                    {
+                        // PROXY FROM DST TO CLIENT
+                    }*/
+
+                    // PROXY FROM CLIENT TO DST
 
                 },{},
                 ba::bind_executor(this->cont_executor(),[](std::exception_ptr e)
@@ -135,7 +184,7 @@ namespace ce
             }
             std::uint8_t last_number(boost::asio::streambuf& streambuf)
             {
-                return static_cast<std::uint8_t>(make_vector(streambuf).back() - '0'); // DEBUG_THINGY: used for symbols
+                return static_cast<std::uint8_t>(make_vector(streambuf).back() - '0'); // NC_DBG: used for symbols
             }
 
         };
