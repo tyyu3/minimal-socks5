@@ -71,7 +71,6 @@ namespace ce
                 // any session content at the cost of one additional pointer of state.
                 spawn(this->executor(),[this,s=shared_from_this()](auto yc)
                 {
-                    #define NC_DBG
                     #ifndef NC_DBG
                         std::uint8_t wanted_version = 0x05;
                         std::uint8_t wanted_method = 0x00;
@@ -90,12 +89,12 @@ namespace ce
 
                     #endif
 
+                   std::vector<unsigned char> buf;
+
                     using namespace boost::log::trivial;
                     boost::system::error_code ec;
 
                     // Client connects and sends a greeting...
-                    stream_.expires_after(time_limit_);
-
                     boost::asio::streambuf read_buffer;
                     std::vector<std::uint8_t> read_vector;
                     bool acceptable_response = true;
@@ -106,7 +105,7 @@ namespace ce
                     bytes_transferred = boost::asio::read(stream_, read_buffer.prepare(last_number(read_buffer)), ec);
                     read_buffer.commit(bytes_transferred);
                     read_vector = make_vector(read_buffer);
-                    BOOST_LOG_TRIVIAL(info) << "Read: "<< std::string(read_vector.begin(), read_vector.end()) << std::endl;
+                    BOOST_LOG_TRIVIAL(info) << "Read: "<< std::hex << std::string(read_vector.begin(), read_vector.end()) << std::endl;
                     if((read_vector[0] != wanted_version) || (std::find(read_vector.begin()+2, read_vector.end(), wanted_method) == read_vector.end()))
                         acceptable_response = false;
                     read_buffer.consume(2 + bytes_transferred); // Remove data that was read.
@@ -149,24 +148,55 @@ namespace ce
                     bytes_transferred = boost::asio::read(stream_, read_buffer.prepare(2), ec);
                     read_buffer.commit(bytes_transferred);
                     read_vector = make_vector(read_buffer);
-                    BOOST_LOG_TRIVIAL(info) << "Read: "<< std::string(read_vector.begin(), read_vector.end()) << std::endl;
-
-                    // TODO: extract IP and port here
-
-                    // read_buffer.consume(???);
-
-                    // boost::asio::io_context m_io_context;
-                    // boost::asio::ip::tcp::socket m_stream{m_io_context};
-                    // boost::asio::connect(m_stream, boost::asio::ip::tcp::resolver{m_io_context}.resolve(ip, port));
-
-                    // Server sends a response similar to SOCKS4.
-
-                    /* spawn(this->executor(),[this,s=shared_from_this()](auto yc)
+                    BOOST_LOG_TRIVIAL(info) << "Read: " << std::string(read_vector.begin(), read_vector.end()) << std::endl;
+                    ba::ip::address_v4 ip;
+                    std::uint16_t port;
+                    std::string domain;
+                    if(read_vector[3] == wanted_address_type[0])
                     {
-                        // PROXY FROM DST TO CLIENT
-                    }*/
+                        auto [t_ip, t_port] = extract_ip_and_port(read_vector);
+                        ip = t_ip;
+                        port = t_port;
+                    }
+                    else if(read_vector[3] == wanted_address_type[1])
+                    {
+                        // TODO: extract (and resolve?) domain here
+                    }
+                    else
+                    {
+                        // TODO: manage unsupported IP types
+                    }
+                    read_buffer.consume(read_vector.size());
 
-                    // PROXY FROM CLIENT TO DST
+                    #ifdef NC_DBG
+                        ip = ba::ip::make_address_v4("13.33.246.59");
+                        port = 80;
+                    #endif
+
+                    ba::io_context io_context;
+                    ba::ip::tcp::socket dst_socket{io_context};
+                    dst_socket.connect({ip, port});
+                    // Server sends a response similar to SOCKS4.
+                    if(!dst_socket.is_open())
+                    {
+                        BOOST_LOG_TRIVIAL(info) << "Failed to connect "<< std::endl;
+                        stream_.close();
+                    }
+                    BOOST_LOG_TRIVIAL(info) << "Connected" << std::endl;
+                    ba::write(stream_, ba::buffer({0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}), ec);
+
+                    spawn(this->executor(),[this,s=shared_from_this()](auto yc) // we spawn another control flow
+                    {
+                        // TODO proxy from destination to client
+
+                    },{},
+                    ba::bind_executor(this->cont_executor(),[](std::exception_ptr e)
+                    {
+                        if(e)
+                            std::rethrow_exception(e);
+                    }));
+
+                    // TODO proxy from client to dst
 
                 },{},
                 ba::bind_executor(this->cont_executor(),[](std::exception_ptr e)
@@ -177,16 +207,25 @@ namespace ce
             }
         private:
             //  std::array<std::uint8_t, max_varied_size> in_buf, out_buf;
-            std::vector<std::uint8_t> make_vector(boost::asio::streambuf& streambuf)
+            std::vector<std::uint8_t> make_vector(boost::asio::streambuf& streambuf) const
             {
               return {boost::asio::buffers_begin(streambuf.data()),
                       boost::asio::buffers_end(streambuf.data())};
             }
-            std::uint8_t last_number(boost::asio::streambuf& streambuf)
+            std::uint8_t last_number(boost::asio::streambuf& streambuf) const
             {
-                return static_cast<std::uint8_t>(make_vector(streambuf).back() - '0'); // NC_DBG: used for symbols
+                return static_cast<std::uint8_t>(make_vector(streambuf).back()); // NC_DBG: used for symbols
             }
+            std::pair<ba::ip::address_v4, std::uint16_t> extract_ip_and_port(std::vector<uint8_t>& connection_request) const
+            {
+                ba::detail::array ip = {connection_request[4], connection_request[5], connection_request[6], connection_request[7]};
+                ba::ip::address_v4 res_ip(ip);
+                std::uint16_t port = (static_cast<std::uint16_t>(connection_request[8]) << 8) | connection_request[9];
+                return {res_ip, port};
 
+            }
+            std::pair<std::string, std::uint16_t> extract_domain_and_port(std::vector<uint8_t>& connection_request) const;
+            void proxy(ba::ip::tcp::socket src, ba::ip::tcp::socket dst);  // TODO
         };
     }
 
