@@ -48,12 +48,8 @@ namespace ce
 
         class calc_session final : public socket_session<calc_session,tcp_stream>
         {
-            constexpr static std::size_t number_limit_ = 1024,
-                                         bytes_per_second_limit = 1024,
-                                         max_varied_size = 256;
-            std::map<std::string, const size_t> sizes = {
-                {"client greeting", 3}
-            };
+            constexpr static std::size_t ethernet_mtu = 1500,
+                                         bytes_per_second_limit = 1024;
             constexpr static boost::asio::steady_timer::duration time_limit_ =
                 std::chrono::seconds(15);
         public:
@@ -166,6 +162,7 @@ namespace ce
                     {
                         // TODO: manage unsupported IP types
                     }
+
                     read_buffer.consume(read_vector.size());
 
                     #ifdef NC_DBG
@@ -183,21 +180,23 @@ namespace ce
                         stream_.close();
                     }
                     BOOST_LOG_TRIVIAL(info) << "Connected" << std::endl;
-                    ba::write(stream_, ba::buffer({0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}), ec);
 
-                    spawn(this->executor(),[this,s=shared_from_this()](auto yc) // we spawn another control flow
+                    ba::write(stream_, ba::buffer({0x05, 0x00, 0x00, 0x01, 0x0d, 0x21, 0xf6, 0x6e, 0x00, 0x50}), ec); //!!!
+
+                    /*spawn(this->executor(),[this,s=shared_from_this(), &dst_socket, &ec](auto yc) // we spawn another control flow
                     {
-                        // TODO proxy from destination to client
+                        // proxy from client to dst
+                        proxy(stream_, dst_socket, yc, ec, "client to dst");
 
                     },{},
                     ba::bind_executor(this->cont_executor(),[](std::exception_ptr e)
                     {
                         if(e)
                             std::rethrow_exception(e);
-                    }));
+                    }));*/
 
-                    // TODO proxy from client to dst
-
+                    // proxy from client to dst
+                    proxy(stream_,dst_socket,  yc, ec, "client to dst");
                 },{},
                 ba::bind_executor(this->cont_executor(),[](std::exception_ptr e)
                 {
@@ -220,12 +219,29 @@ namespace ce
             {
                 ba::detail::array ip = {connection_request[4], connection_request[5], connection_request[6], connection_request[7]};
                 ba::ip::address_v4 res_ip(ip);
-                std::uint16_t port = (static_cast<std::uint16_t>(connection_request[8]) << 8) | connection_request[9];
+                std::uint16_t port = (static_cast<std::uint16_t>(connection_request[8]) << 8) | connection_request[9]; // TODO: switch to memcpy <3
                 return {res_ip, port};
 
             }
             std::pair<std::string, std::uint16_t> extract_domain_and_port(std::vector<uint8_t>& connection_request) const;
-            void proxy(ba::ip::tcp::socket src, ba::ip::tcp::socket dst);  // TODO
+            template<typename Src, typename Dst, typename YieldContext, typename ErrorCode>
+            void proxy(Src& src, Dst& dst, YieldContext& yc, ErrorCode& ec, std::string s)
+            {
+                for(;;)
+                {
+                    std::vector<uint8_t> buf;
+                    stream_.expires_after(time_limit_);
+                    size_t bytes_read = ba::async_read(src, ba::buffer(buf, ethernet_mtu), yc[ec]);
+                    BOOST_LOG_TRIVIAL(info) << s << ": read " << bytes_read << std::endl;
+                    size_t bytes_written = ba::async_write(dst, ba::buffer(buf, bytes_read), yc[ec]);
+                    BOOST_LOG_TRIVIAL(info) << s << ": wrote " << bytes_written << std::endl;
+                    if(bytes_read != bytes_written)
+                    {
+                        BOOST_LOG_TRIVIAL(warning) << "bytes_read != bytes_written" << std::endl;
+                    }
+                }
+
+            }
         };
     }
 
