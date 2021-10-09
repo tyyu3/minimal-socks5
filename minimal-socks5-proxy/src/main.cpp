@@ -73,7 +73,7 @@ namespace ce
                         std::uint8_t failure_marker = 0xff;
                         std::uint8_t wanted_command = 0x01;
                         std::uint8_t wanted_reserve = 0x00;
-                        std::vector<std::uint8_t> wanted_address_type = {0x01, 0x33};
+                        std::vector<std::uint8_t> wanted_address_type = {0x01, 0x03};
                     #endif
                     #ifdef NC_DBG
                         std::uint8_t wanted_version = '5';
@@ -148,15 +148,23 @@ namespace ce
                     ba::ip::address_v4 ip;
                     std::uint16_t port;
                     std::string domain;
+                    auto ex = stream_.get_executor();
+                    ba::ip::tcp::socket dst_socket{ex};
                     if(read_vector[3] == wanted_address_type[0])
                     {
                         auto [t_ip, t_port] = extract_ip_and_port(read_vector);
                         ip = t_ip;
                         port = t_port;
+                        dst_socket.connect({ip, port});
+
                     }
                     else if(read_vector[3] == wanted_address_type[1])
                     {
-                        // TODO: extract (and resolve?) domain here
+                         auto [t_domain, t_port] = extract_domain_and_port(read_vector);// TODO: extract (and resolve?) domain here
+                         domain = t_domain;
+                         port = t_port;
+                         auto resolved = ba::ip::tcp::resolver{ex}.resolve(domain, std::to_string(port));
+                         ba::connect(dst_socket, resolved);
                     }
                     else
                     {
@@ -165,38 +173,32 @@ namespace ce
 
                     read_buffer.consume(read_vector.size());
 
-                    #ifdef NC_DBG
-                        ip = ba::ip::make_address_v4("13.33.246.59");
-                        port = 80;
-                    #endif
-
-                    ba::io_context io_context;
-                    ba::ip::tcp::socket dst_socket{io_context};
-                    dst_socket.connect({ip, port});
                     // Server sends a response similar to SOCKS4.
                     if(!dst_socket.is_open())
                     {
                         BOOST_LOG_TRIVIAL(info) << "Failed to connect "<< std::endl;
+                        // TODO: make sure there there is no response in RFC
                         stream_.close();
                     }
                     BOOST_LOG_TRIVIAL(info) << "Connected" << std::endl;
 
-                    ba::write(stream_, ba::buffer({0x05, 0x00, 0x00, 0x01, 0x0d, 0x21, 0xf6, 0x6e, 0x00, 0x50}), ec); //!!!
+                    std::vector<uint8_t> response = {0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }; // TODO: parse correctly
+                    ba::write(stream_, ba::buffer(response), ec);
 
-                    /*spawn(this->executor(),[this,s=shared_from_this(), &dst_socket, &ec](auto yc) // we spawn another control flow
+                    spawn(this->executor(),[this,s=shared_from_this(), &dst_socket, &ec](auto yc) // we spawn another control flow
                     {
-                        // proxy from client to dst
-                        proxy(stream_, dst_socket, yc, ec, "client to dst");
+                        // proxy from dst to client
+                        proxy(dst_socket, stream_, yc, ec, "dst to client");
 
                     },{},
                     ba::bind_executor(this->cont_executor(),[](std::exception_ptr e)
                     {
                         if(e)
                             std::rethrow_exception(e);
-                    }));*/
+                    }));
 
                     // proxy from client to dst
-                    proxy(stream_,dst_socket,  yc, ec, "client to dst");
+                    proxy(stream_, dst_socket, yc, ec, "client to dst");
                 },{},
                 ba::bind_executor(this->cont_executor(),[](std::exception_ptr e)
                 {
@@ -205,7 +207,6 @@ namespace ce
                 }));
             }
         private:
-            //  std::array<std::uint8_t, max_varied_size> in_buf, out_buf;
             std::vector<std::uint8_t> make_vector(boost::asio::streambuf& streambuf) const
             {
               return {boost::asio::buffers_begin(streambuf.data()),
@@ -219,28 +220,37 @@ namespace ce
             {
                 ba::detail::array ip = {connection_request[4], connection_request[5], connection_request[6], connection_request[7]};
                 ba::ip::address_v4 res_ip(ip);
-                std::uint16_t port = (static_cast<std::uint16_t>(connection_request[8]) << 8) | connection_request[9]; // TODO: switch to memcpy <3
-                return {res_ip, port};
+                std::vector<std::uint8_t> port = {connection_request[9], connection_request[8]};
+                std::uint16_t res_port;
+                std::memcpy(&res_port, port.data(), 2);
+                return {res_ip, res_port};
 
             }
-            std::pair<std::string, std::uint16_t> extract_domain_and_port(std::vector<uint8_t>& connection_request) const;
+            std::pair<std::string, std::uint16_t> extract_domain_and_port(std::vector<uint8_t>& connection_request) const
+            {
+                std::string domain(connection_request.begin() + 5, connection_request.begin() + 5 + connection_request[4]);
+                std::vector<std::uint8_t> port = {connection_request.data()[connection_request.size() - 1], connection_request.data()[connection_request.size() - 2]};
+                std::uint16_t res_port;
+                std::memcpy(&res_port, port.data(), 2);
+                return {domain, res_port};
+
+            }
             template<typename Src, typename Dst, typename YieldContext, typename ErrorCode>
             void proxy(Src& src, Dst& dst, YieldContext& yc, ErrorCode& ec, std::string s)
             {
-                for(;;)
-                {
-                    std::vector<uint8_t> buf;
-                    stream_.expires_after(time_limit_);
-                    size_t bytes_read = ba::async_read(src, ba::buffer(buf, ethernet_mtu), yc[ec]);
-                    BOOST_LOG_TRIVIAL(info) << s << ": read " << bytes_read << std::endl;
-                    size_t bytes_written = ba::async_write(dst, ba::buffer(buf, bytes_read), yc[ec]);
-                    BOOST_LOG_TRIVIAL(info) << s << ": wrote " << bytes_written << std::endl;
-                    if(bytes_read != bytes_written)
+                    for(;;)
                     {
-                        BOOST_LOG_TRIVIAL(warning) << "bytes_read != bytes_written" << std::endl;
+                        std::vector<uint8_t> buf(ethernet_mtu);
+                        stream_.expires_after(time_limit_);
+                        size_t bytes_read = src.async_read_some(ba::buffer(buf), yc[ec]);
+                        BOOST_LOG_TRIVIAL(trace) << s << ": read " << bytes_read << std::endl;
+                        size_t bytes_written = ba::async_write(dst, ba::buffer(buf, bytes_read), yc[ec]);
+                        BOOST_LOG_TRIVIAL(trace) << s << ": wrote " << bytes_written << std::endl;
+                        if(bytes_read != bytes_written)
+                        {
+                            BOOST_LOG_TRIVIAL(trace) << "bytes_read != bytes_written" << std::endl;
+                        }
                     }
-                }
-
             }
         };
     }
