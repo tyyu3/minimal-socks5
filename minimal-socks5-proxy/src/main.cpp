@@ -6,20 +6,9 @@
 #include <ce/spawn.hpp>
 #include <ce/tcp_listener.hpp>
 
-#include <boost/asio/bind_executor.hpp>
-#include <boost/asio/buffer.hpp>
-#include <boost/asio/execution/execute.hpp>
-#include <boost/asio/io_context.hpp>
-#include <boost/asio/read_until.hpp>
-#include <boost/asio/read.hpp>
-#include <boost/asio/static_thread_pool.hpp>
-#include <boost/asio/strand.hpp>
-#include <boost/asio/write.hpp>
 #include <boost/beast/core/tcp_stream.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
 
-//headers I've included in September
-#include <boost/asio/streambuf.hpp>
 #include <boost/asio.hpp>
 
 #include <exception>
@@ -49,7 +38,7 @@ namespace ce
         class calc_session final : public socket_session<calc_session,tcp_stream>
         {
             constexpr static std::size_t ethernet_mtu = 1500,
-                                         bytes_per_second_limit = 1024;
+                                         bytes_per_second_limit = 1500;
             constexpr static boost::asio::steady_timer::duration time_limit_ =
                 std::chrono::seconds(15);
         public:
@@ -67,23 +56,15 @@ namespace ce
                 // any session content at the cost of one additional pointer of state.
                 spawn(this->executor(),[this,s=shared_from_this()](auto yc)
                 {
-                    #ifndef NC_DBG
-                        std::uint8_t wanted_version = 0x05;
-                        std::uint8_t wanted_method = 0x00;
-                        std::uint8_t failure_marker = 0xff;
-                        std::uint8_t wanted_command = 0x01;
-                        std::uint8_t wanted_reserve = 0x00;
-                        std::vector<std::uint8_t> wanted_address_type = {0x01, 0x03};
-                    #endif
-                    #ifdef NC_DBG
-                        std::uint8_t wanted_version = '5';
-                        std::uint8_t wanted_method = '0';
-                        std::uint8_t failure_marker = 'F';
-                        std::uint8_t wanted_command = '1';
-                        std::uint8_t wanted_reserve = '0';
-                        std::vector<std::uint8_t> wanted_address_type = {'1', '3'};
 
-                    #endif
+                   constexpr std::uint8_t wanted_version = 0x05;
+                   constexpr std::uint8_t wanted_method = 0x00;
+                   constexpr std::uint8_t failure_marker = 0xff;
+                   constexpr std::uint8_t wanted_command = 0x01;
+                   constexpr std::uint8_t wanted_reserve = 0x00;
+                   const std::vector<std::uint8_t> wanted_address_type = {0x01, 0x03};
+                   constexpr std::uint8_t successful_conn = 0x00;
+                   constexpr std::uint8_t failed_conn = 0x01;
 
                    std::vector<unsigned char> buf;
 
@@ -122,7 +103,7 @@ namespace ce
                     bytes_transferred = boost::asio::read(stream_, read_buffer.prepare(4), ec);
                     read_buffer.commit(bytes_transferred);
                     read_vector = make_vector(read_buffer);
-                    if(read_vector[0] != wanted_version)  // TODO: & other checks here for command and reserve
+                    if((read_vector[0] != wanted_version) || (read_vector[1] != wanted_command) || (read_vector[2] != wanted_reserve) )
                     {
                         BOOST_LOG_TRIVIAL(info) << "Bad response "<< std::endl;
                         stream_.close();
@@ -160,7 +141,7 @@ namespace ce
                     }
                     else if(read_vector[3] == wanted_address_type[1])
                     {
-                         auto [t_domain, t_port] = extract_domain_and_port(read_vector);// TODO: extract (and resolve?) domain here
+                         auto [t_domain, t_port] = extract_domain_and_port(read_vector);
                          domain = t_domain;
                          port = t_port;
                          auto resolved = ba::ip::tcp::resolver{ex}.resolve(domain, std::to_string(port));
@@ -168,21 +149,23 @@ namespace ce
                     }
                     else
                     {
-                        // TODO: manage unsupported IP types
+                        BOOST_LOG_TRIVIAL(info) << "Unsupported IP type "<< std::endl;
+                        dst_socket.close();
+                        stream_.close();
                     }
 
                     read_buffer.consume(read_vector.size());
 
                     // Server sends a response similar to SOCKS4.
+                    std::vector<uint8_t> response = {0x05, successful_conn, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
                     if(!dst_socket.is_open())
                     {
                         BOOST_LOG_TRIVIAL(info) << "Failed to connect "<< std::endl;
-                        // TODO: make sure there there is no response in RFC
+                        response[1] = failed_conn;
+                        ba::write(stream_, ba::buffer(response), ec);
                         stream_.close();
                     }
                     BOOST_LOG_TRIVIAL(info) << "Connected" << std::endl;
-
-                    std::vector<uint8_t> response = {0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }; // TODO: parse correctly
                     ba::write(stream_, ba::buffer(response), ec);
 
                     spawn(this->executor(),[this,s=shared_from_this(), &dst_socket, &ec](auto yc) // we spawn another control flow
@@ -207,6 +190,7 @@ namespace ce
                 }));
             }
         private:
+            std::vector<uint8_t> buf;
             std::vector<std::uint8_t> make_vector(boost::asio::streambuf& streambuf) const
             {
               return {boost::asio::buffers_begin(streambuf.data()),
@@ -240,11 +224,15 @@ namespace ce
             {
                     for(;;)
                     {
-                        std::vector<uint8_t> buf(ethernet_mtu);
+                        buf.resize(ethernet_mtu);
                         stream_.expires_after(time_limit_);
                         size_t bytes_read = src.async_read_some(ba::buffer(buf), yc[ec]);
+                        if(ec)
+                            return;
                         BOOST_LOG_TRIVIAL(trace) << s << ": read " << bytes_read << std::endl;
                         size_t bytes_written = ba::async_write(dst, ba::buffer(buf, bytes_read), yc[ec]);
+                        if(ec)
+                            return;
                         BOOST_LOG_TRIVIAL(trace) << s << ": wrote " << bytes_written << std::endl;
                         if(bytes_read != bytes_written)
                         {
@@ -263,12 +251,14 @@ namespace ce
         if(!port||!*port)
             throw std::runtime_error("Port must be in [1;65535]");
         unsigned threads;
-        if(args.size()==3){
+        if(args.size()==3)
+        {
             auto t = from_chars<unsigned>(args[2]);
             if(!t||!*t)
                 throw std::runtime_error("Threads must be a non-zero unsigned integer");
             threads = *t;
-        }else
+        }
+        else
             threads = std::thread::hardware_concurrency();
         using namespace boost::log::trivial;
         BOOST_LOG_TRIVIAL(info) << "Using " << threads << " threads.";
