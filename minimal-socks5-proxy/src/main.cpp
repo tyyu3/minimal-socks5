@@ -76,13 +76,14 @@ namespace ce
                     std::vector<std::uint8_t> read_vector;
                     bool acceptable_response = true;
 
-                    auto bytes_transferred = boost::asio::read(stream_, read_buffer.prepare(2), ec);
+                    auto bytes_transferred = boost::asio::async_read(stream_, read_buffer.prepare(2), yc[ec]);
                     read_buffer.commit(bytes_transferred);
                     // ...which includes a list of authentication methods supported.
-                    bytes_transferred = boost::asio::read(stream_, read_buffer.prepare(last_number(read_buffer)), ec);
+                    bytes_transferred = boost::asio::async_read(stream_, read_buffer.prepare(last_number(read_buffer)), yc[ec]);
                     read_buffer.commit(bytes_transferred);
                     read_vector = make_vector(read_buffer);
                     BOOST_LOG_TRIVIAL(info) << "Read: "<< std::hex << std::string(read_vector.begin(), read_vector.end()) << std::endl;
+                    BOOST_LOG_TRIVIAL(trace) << s << read_vector.size() << std::endl;
                     if((read_vector[0] != wanted_version) || (std::find(read_vector.begin()+2, read_vector.end(), wanted_method) == read_vector.end()))
                         acceptable_response = false;
                     read_buffer.consume(2 + bytes_transferred); // Remove data that was read.
@@ -153,7 +154,7 @@ namespace ce
                         dst_socket.close();
                         stream_.close();
                     }
-
+                    BOOST_LOG_TRIVIAL(trace) << s << read_vector.size() << std::endl;
                     read_buffer.consume(read_vector.size());
 
                     // Server sends a response similar to SOCKS4.
@@ -168,7 +169,7 @@ namespace ce
                     BOOST_LOG_TRIVIAL(info) << "Connected" << std::endl;
                     ba::write(stream_, ba::buffer(response), ec);
 
-                    spawn(this->executor(),[this,s=shared_from_this(), &dst_socket, &ec](auto yc) // we spawn another control flow
+                    spawn(this->executor(),[this, s, &dst_socket, &ec](auto yc) // we spawn another control flow with a local yc
                     {
                         // proxy from dst to client
                         proxy(dst_socket, stream_, yc, ec, "dst to client");
@@ -213,24 +214,26 @@ namespace ce
             std::pair<std::string, std::uint16_t> extract_domain_and_port(std::vector<uint8_t>& connection_request) const
             {
                 std::string domain(connection_request.begin() + 5, connection_request.begin() + 5 + connection_request[4]);
-                std::vector<std::uint8_t> port = {connection_request.data()[connection_request.size() - 1], connection_request.data()[connection_request.size() - 2]};
+                std::vector<std::uint8_t> port = {connection_request.data()[connection_request.size() - 1],
+                                                  connection_request.data()[connection_request.size() - 2]};
                 std::uint16_t res_port;
                 std::memcpy(&res_port, port.data(), 2);
                 return {domain, res_port};
 
             }
             template<typename Src, typename Dst, typename YieldContext, typename ErrorCode>
-            void proxy(Src& src, Dst& dst, YieldContext& yc, ErrorCode& ec, std::string s)
+            void proxy(Src& src, Dst& dst, YieldContext& yc, ErrorCode& ec, const std::string s)
             {
                     for(;;)
                     {
+                        std::vector<uint8_t> buf;
                         buf.resize(ethernet_mtu);
                         stream_.expires_after(time_limit_);
                         size_t bytes_read = src.async_read_some(ba::buffer(buf), yc[ec]);
                         if(ec)
                             return;
                         BOOST_LOG_TRIVIAL(trace) << s << ": read " << bytes_read << std::endl;
-                        size_t bytes_written = ba::async_write(dst, ba::buffer(buf, bytes_read), yc[ec]);
+                        size_t bytes_written = dst.async_write_some(ba::buffer(buf, bytes_read), yc[ec]);
                         if(ec)
                             return;
                         BOOST_LOG_TRIVIAL(trace) << s << ": wrote " << bytes_written << std::endl;
